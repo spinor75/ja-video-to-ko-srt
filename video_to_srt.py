@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import whisper
@@ -155,20 +156,45 @@ def extract_audio(video_path: str, audio_path: str) -> None:
 
 # ── 번역 ──────────────────────────────────────────────────────────────────────
 
+# Google Translate 무료 API 제한: 초당 5회
+_TRANSLATE_INTERVAL = 1.0 / 4  # 4회/초로 안전하게 제한
+
+
 def translate_segments(segments: list[dict], source_lang: str = "auto") -> list[dict]:
     """각 segment의 텍스트를 한국어로 번역하여 'translated' 키 추가"""
     translator = GoogleTranslator(source=source_lang, target="ko")
     texts = [seg["text"].strip() for seg in segments]
 
     translated = []
+    last_request_time = 0.0
+
     for text in tqdm(texts, desc="번역 중", unit="seg"):
         if text:
+            # 속도 제한: 이전 요청으로부터 충분한 시간이 지나지 않았으면 대기
+            elapsed = time.monotonic() - last_request_time
+            if elapsed < _TRANSLATE_INTERVAL:
+                time.sleep(_TRANSLATE_INTERVAL - elapsed)
+
             try:
+                last_request_time = time.monotonic()
                 result = translator.translate(text)
                 translated.append(result if result is not None else text)
             except Exception as e:
-                print(f"  [경고] 번역 실패 ({e}), 원문 유지: {text}")
-                translated.append(text)
+                error_msg = str(e)
+                if "too many requests" in error_msg.lower() or "429" in error_msg:
+                    # 속도 초과 시 5초 대기 후 재시도
+                    print(f"\n  [경고] 요청 초과, 5초 대기 후 재시도...")
+                    time.sleep(5)
+                    try:
+                        last_request_time = time.monotonic()
+                        result = translator.translate(text)
+                        translated.append(result if result is not None else text)
+                    except Exception:
+                        print(f"  [경고] 재시도 실패, 원문 유지: {text}")
+                        translated.append(text)
+                else:
+                    print(f"  [경고] 번역 실패 ({e}), 원문 유지: {text}")
+                    translated.append(text)
         else:
             translated.append("")
 
