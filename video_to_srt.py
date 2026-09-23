@@ -156,47 +156,67 @@ def extract_audio(video_path: str, audio_path: str) -> None:
 
 # ── 번역 ──────────────────────────────────────────────────────────────────────
 
-# Google Translate 무료 API 제한: 초당 5회
-_TRANSLATE_INTERVAL = 1.0 / 4  # 4회/초로 안전하게 제한
+_MIN_INTERVAL = 1.0 / 4       # 평상시 최소 간격 (4회/초)
+_MAX_INTERVAL = 30.0          # 간격 상한
+_MAX_RETRIES = 6              # 세그먼트 하나당 최대 재시도 횟수
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "too many requests" in msg or "429" in msg
 
 
 def translate_segments(segments: list[dict], source_lang: str = "auto") -> list[dict]:
-    """각 segment의 텍스트를 한국어로 번역하여 'translated' 키 추가"""
+    """각 segment의 텍스트를 한국어로 번역하여 'translated' 키 추가
+
+    429(요청 초과)가 반복되면 간격을 점점 늘리는 적응형 백오프를 사용한다.
+    IP가 일시적으로 차단된 경우 단순 재시도로는 부족하므로, 실패할 때마다
+    간격을 2배로 늘리고 성공하면 서서히 최소 간격으로 되돌린다.
+    """
     translator = GoogleTranslator(source=source_lang, target="ko")
     texts = [seg["text"].strip() for seg in segments]
 
     translated = []
     last_request_time = 0.0
+    interval = _MIN_INTERVAL
 
-    for text in tqdm(texts, desc="번역 중", unit="seg"):
-        if text:
-            # 속도 제한: 이전 요청으로부터 충분한 시간이 지나지 않았으면 대기
+    pbar = tqdm(texts, desc="번역 중", unit="seg")
+    for text in pbar:
+        if not text:
+            translated.append("")
+            continue
+
+        result_text = None
+        for attempt in range(_MAX_RETRIES):
             elapsed = time.monotonic() - last_request_time
-            if elapsed < _TRANSLATE_INTERVAL:
-                time.sleep(_TRANSLATE_INTERVAL - elapsed)
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
 
             try:
                 last_request_time = time.monotonic()
                 result = translator.translate(text)
-                translated.append(result if result is not None else text)
+                result_text = result if result is not None else text
+                # 연속 성공 시 간격을 서서히 줄임
+                interval = max(_MIN_INTERVAL, interval * 0.8)
+                break
             except Exception as e:
-                error_msg = str(e)
-                if "too many requests" in error_msg.lower() or "429" in error_msg:
-                    # 속도 초과 시 5초 대기 후 재시도
-                    print(f"\n  [경고] 요청 초과, 5초 대기 후 재시도...")
-                    time.sleep(5)
-                    try:
-                        last_request_time = time.monotonic()
-                        result = translator.translate(text)
-                        translated.append(result if result is not None else text)
-                    except Exception:
-                        print(f"  [경고] 재시도 실패, 원문 유지: {text}")
-                        translated.append(text)
+                last_request_time = time.monotonic()
+                if _is_rate_limit_error(e):
+                    interval = min(_MAX_INTERVAL, max(interval, _MIN_INTERVAL) * 2)
+                    pbar.write(
+                        f"  [경고] 요청 초과 (시도 {attempt + 1}/{_MAX_RETRIES}), "
+                        f"{interval:.1f}초로 간격 늘려 재시도..."
+                    )
+                    time.sleep(interval)
                 else:
-                    print(f"  [경고] 번역 실패 ({e}), 원문 유지: {text}")
-                    translated.append(text)
-        else:
-            translated.append("")
+                    pbar.write(f"  [경고] 번역 실패 ({e}), 원문 유지: {text}")
+                    break
+
+        if result_text is None:
+            pbar.write(f"  [경고] {_MAX_RETRIES}회 재시도 실패, 원문 유지: {text}")
+            result_text = text
+
+        translated.append(result_text)
 
     for seg, ko in zip(segments, translated):
         seg["translated"] = ko
